@@ -21,6 +21,11 @@
   ];
 
   let custom = [];
+  let cloudReady = false;
+  let loadingCloud = false;
+  let localItems = [];
+  let migrating = false;
+  let storageInfo = null;
   let filter = 'all';
   let favoriteOnly = false;
   let search = '';
@@ -31,9 +36,11 @@
     try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
   }
   const storedFavorites = readLocal(STORAGE.favorites, []);
-  let favorites = new Set(Array.isArray(storedFavorites) ? storedFavorites.filter(x => typeof x === 'string') : []);
-  let profile = readLocal(STORAGE.profile, {});
-  if (!profile || typeof profile !== 'object' || Array.isArray(profile)) profile = {};
+  const localFavorites = new Set(Array.isArray(storedFavorites) ? storedFavorites.filter(x => typeof x === 'string') : []);
+  const storedProfile = readLocal(STORAGE.profile, {});
+  const localProfile = storedProfile && typeof storedProfile === 'object' && !Array.isArray(storedProfile) ? storedProfile : {};
+  let favorites = new Set();
+  let profile = {};
 
   function el(tag, className, text) {
     const node = document.createElement(tag);
@@ -89,24 +96,131 @@
       request.onerror = () => reject(new Error('读取本地回忆失败，请刷新后重试。'));
     });
   }
-  async function saveStored(items) {
-    const db = await dbReady;
-    return new Promise((resolve, reject) => {
-      const transaction = db.transaction('memories', 'readwrite');
-      for (const item of items) transaction.objectStore('memories').put(item);
-      transaction.oncomplete = resolve;
-      transaction.onerror = () => reject(new Error('未能保存回忆。设备空间可能不足，请先导出备份并释放空间。'));
-      transaction.onabort = () => reject(new Error('保存没有完成，请检查设备空间后重试。'));
-    });
+  async function api(path, options = {}) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120000);
+    try {
+      const response = await fetch(path, { credentials: 'same-origin', cache: 'no-store', ...options, signal: controller.signal });
+      const contentType = response.headers.get('content-type') || '';
+      let data = null;
+      if (contentType.includes('application/json')) data = await response.json();
+      if (!response.ok) {
+        const message = typeof data?.error === 'string' ? data.error : typeof data?.message === 'string' ? data.message : '';
+        throw new Error(message || (response.status === 401 || response.status === 403 ? '请确认已登录这个私有网站，然后刷新重试。' : `云端请求未完成（${response.status}），请稍后重试。`));
+      }
+      if (!data || typeof data !== 'object') throw new Error('云端没有返回有效数据，请重新登录或刷新重试。');
+      return data;
+    } catch (error) {
+      if (error.name === 'AbortError') throw new Error('连接云端超时，内容尚未确认保存。请检查网络后重试。');
+      if (error instanceof TypeError) throw new Error('暂时无法连接云端，请检查网络后重试。');
+      throw error;
+    } finally { clearTimeout(timeout); }
   }
-  async function removeStored(id) {
-    const db = await dbReady;
-    return new Promise((resolve, reject) => {
-      const transaction = db.transaction('memories', 'readwrite');
-      transaction.objectStore('memories').delete(id);
-      transaction.oncomplete = resolve;
-      transaction.onerror = () => reject(new Error('删除没有完成，请重试。'));
-    });
+  const jsonOptions = (value) => ({ method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(value) });
+  function requireCloud() {
+    if (!cloudReady) throw new Error('云端尚未连接，请点击「刷新状态」后再保存。');
+  }
+  function validMemory(item) {
+    return item && typeof item.id === 'string' && /^m-[a-zA-Z0-9-]{1,90}$/.test(item.id) && KINDS.includes(item.type) && validDate(item.date) && typeof item.title === 'string' && typeof item.text === 'string';
+  }
+  function formatBytes(bytes) {
+    if (!Number.isFinite(bytes) || bytes < 0) return '—';
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1000)), units.length - 1);
+    return `${(bytes / 1000 ** index).toLocaleString('zh-CN', { maximumFractionDigits: index ? 2 : 0 })} ${units[index]}`;
+  }
+  function paintStorage(info) {
+    storageInfo = info || storageInfo;
+    const used = $('#cloud-used'); if (used) used.textContent = storageInfo ? formatBytes(storageInfo.mediaUsedBytes) : '—';
+    const count = $('#cloud-count'); if (count) count.textContent = Number.isFinite(storageInfo?.mediaCount) ? `${storageInfo.mediaCount} 个` : '—';
+    const db = $('#cloud-db-limit'); if (db) db.textContent = '每个站点上限 10 GB';
+    const file = $('#cloud-file-limit'); if (file) file.textContent = '每个站点未设固定容量上限';
+    const account = $('#cloud-account-remaining'); if (account) account.textContent = '平台未提供查询';
+    const max = $('#cloud-max-file'); if (max) max.textContent = '单个文件最大 30 MB';
+  }
+  function cloudStatus(state, message) {
+    const status = $('#cloud-status');
+    if (status) { status.textContent = state === 'ready' ? '私有云端已连接' : state === 'loading' ? '正在连接云端…' : '云端暂未连接'; status.dataset.state = state; }
+    const note = $('#cloud-status-note');
+    if (note) note.textContent = message || (state === 'ready' ? '新增回忆已改为云端保存，登录同一账号可在不同设备查看。' : state === 'loading' ? '正在读取回忆与文件用量。' : '连接失败，请刷新状态后再保存。');
+    const button = $('#cloud-refresh'); if (button) button.disabled = state === 'loading';
+  }
+  function pendingLocal() {
+    const ids = new Set(custom.map(item => item.id));
+    return localItems.filter(item => !ids.has(item.id));
+  }
+  function renderMigration() {
+    const pending = pendingLocal();
+    const hasProfile = !profile.names && typeof localProfile.names === 'string' && localProfile.names.trim();
+    const missingFavorites = [...localFavorites].some(id => !favorites.has(id));
+    const show = pending.length > 0 || hasProfile || missingFavorites;
+    const wrap = $('#local-migration'); if (wrap) wrap.hidden = !show;
+    const copy = $('#local-migration-copy');
+    if (copy) copy.textContent = pending.length ? `这台浏览器还有 ${pending.length} 条旧回忆尚未保存到云端。同步后保留本机原件；已有云端昵称与纪念日会保留。` : '检测到本机旧版昵称、纪念日或收藏，可同步到云端。本机原件仍然保留。';
+    const button = $('#migrate-local');
+    if (button) { button.textContent = migrating ? '正在同步，请稍候…' : pending.length ? `将本机 ${pending.length} 条回忆存到云端` : '同步本机纪念日与收藏'; button.disabled = !cloudReady || migrating; }
+  }
+  async function loadCloud({ silent = false } = {}) {
+    if (loadingCloud) return;
+    loadingCloud = true; cloudStatus('loading');
+    try {
+      const data = await api('/api/memories');
+      if (!Array.isArray(data.memories) || !Array.isArray(data.favorites) || !data.profile || typeof data.profile !== 'object') throw new Error('云端回忆数据格式异常，请稍后重试。');
+      if (data.storage?.connected === false) throw new Error('云端存储尚未就绪，请稍后刷新重试。');
+      custom = data.memories.filter(validMemory);
+      favorites = new Set(data.favorites.filter(id => typeof id === 'string'));
+      profile = data.profile; cloudReady = true;
+      paintStorage(data.storage); renderGallery(); updateProfile(); renderMigration(); cloudStatus('ready');
+    } catch (error) {
+      cloudReady = false; cloudStatus('error', error.message); renderGallery(); renderMigration();
+      if (!silent) toast(error.message);
+      throw error;
+    } finally { loadingCloud = false; const button = $('#cloud-refresh'); if (button) button.disabled = false; }
+  }
+  async function refreshStorage() {
+    try { paintStorage(await api('/api/storage')); }
+    catch (error) { cloudStatus('error', `回忆操作已完成，但用量刷新失败：${error.message}`); }
+  }
+  async function uploadMemory(item) {
+    const data = new FormData();
+    for (const key of ['id', 'type', 'title', 'date', 'text', 'location']) if (typeof item[key] === 'string') data.set(key, item[key]);
+    if (item.blob) data.set('file', item.blob, item.filename || 'memory');
+    const response = await api('/api/memories', { method: 'POST', body: data });
+    if (!validMemory(response.memory)) throw new Error('云端未确认这条回忆，暂不标记为已保存。请刷新查看后重试。');
+    const existing = custom.findIndex(memory => memory.id === response.memory.id);
+    if (existing === -1) custom.push(response.memory); else custom[existing] = response.memory;
+    return response.memory;
+  }
+  async function saveProfile(next) {
+    const response = await api('/api/profile', jsonOptions(next));
+    if (!response.profile || typeof response.profile !== 'object') throw new Error('云端未确认昵称与纪念日，请刷新重试。');
+    profile = response.profile; updateProfile();
+  }
+  async function saveFavorite(id, liked) {
+    const response = await api(`/api/favorites/${encodeURIComponent(id)}`, jsonOptions({ liked }));
+    if (typeof response.liked !== 'boolean') throw new Error('云端未确认收藏状态，请刷新重试。');
+    if (response.liked) favorites.add(id); else favorites.delete(id);
+  }
+  async function migrateLocal() {
+    const errorNode = $('#migration-error'); if (errorNode) { errorNode.hidden = true; errorNode.textContent = ''; }
+    let saved = 0;
+    try {
+      requireCloud(); migrating = true; renderMigration();
+      const pending = pendingLocal();
+      for (const item of pending) { await uploadMemory(item); saved++; renderGallery(); }
+      if (!profile.names && typeof localProfile.names === 'string' && localProfile.names.trim()) {
+        const start = validDate(localProfile.start) && localProfile.start <= today() ? localProfile.start : '';
+        await saveProfile({ names: localProfile.names.slice(0, 40), start });
+      }
+      for (const id of localFavorites) if (!favorites.has(id)) await saveFavorite(id, true);
+      renderGallery(); renderMigration(); await refreshStorage();
+      toast(`已将 ${saved} 条旧回忆保存到云端，本机原件仍保留。`);
+    } catch (error) {
+      const message = `本次已保存 ${saved} 条回忆。${error.message} 可再次同步，已保存的回忆不会重复创建。`;
+      if (errorNode) { errorNode.textContent = message; errorNode.hidden = false; }
+      toast(message);
+    } finally { migrating = false; renderMigration(); }
   }
 
   function favoriteButton(item) {
@@ -114,15 +228,13 @@
     button.type = 'button'; button.dataset.testid = 'favorite-toggle';
     button.setAttribute('aria-label', `${favorites.has(item.id) ? '取消喜欢' : '喜欢'}：${item.title}`);
     button.setAttribute('aria-pressed', String(favorites.has(item.id)));
-    button.classList.toggle('is-favorite', favorites.has(item.id)); button.append(heartIcon());
-    button.addEventListener('click', (event) => {
-      event.stopPropagation();
-      const next = new Set(favorites);
-      if (next.has(item.id)) next.delete(item.id); else next.add(item.id);
-      try { localStorage.setItem(STORAGE.favorites, JSON.stringify([...next])); favorites = next; }
-      catch { toast('浏览器未允许保存喜欢，请检查存储权限。'); return; }
-      renderGallery();
-      if ($('#detail-dialog')?.open && currentId === item.id) renderDetail(item);
+    button.classList.toggle('is-favorite', favorites.has(item.id)); button.append(heartIcon()); button.disabled = !cloudReady;
+    button.addEventListener('click', async (event) => {
+      event.stopPropagation(); button.disabled = true;
+      try {
+        requireCloud(); await saveFavorite(item.id, !favorites.has(item.id)); renderGallery();
+        if ($('#detail-dialog')?.open && currentId === item.id) renderDetail(item);
+      } catch (error) { toast(error.message); button.disabled = !cloudReady; }
     });
     return button;
   }
@@ -146,7 +258,7 @@
       open.dataset.testid = 'photo-open'; open.setAttribute('aria-label', `查看回忆：${item.title}`);
       if (item.type === 'photo' || item.type === 'video') {
         const visual = el('div', 'memory-image');
-        if (item.type === 'video' && item.blob) {
+        if (item.type === 'video' && (item.blob || !item.sample)) {
           const video = el('video'); video.src = mediaURL(item); video.preload = 'metadata'; video.muted = true; video.playsInline = true; video.setAttribute('aria-hidden', 'true'); visual.append(video);
         } else {
           const image = el('img'); image.src = item.poster || mediaURL(item); image.alt = item.title; image.loading = 'lazy'; image.decoding = 'async'; visual.append(image);
@@ -191,12 +303,12 @@
     if (!item.sample) {
       const remove = el('button', 'text-button delete-memory', '删除这条回忆'); remove.type = 'button';
       remove.addEventListener('click', async () => {
-        if (!window.confirm('确定从这台设备删除这条回忆吗？建议先导出备份。')) return;
+        if (!window.confirm('确定从云端删除这条回忆和媒体文件吗？所有设备都会同步删除，建议先导出备份。')) return;
         remove.disabled = true;
         try {
-          await removeStored(item.id); custom = custom.filter(memory => memory.id !== item.id);
+          requireCloud(); await api(`/api/memories/${encodeURIComponent(item.id)}`, { method: 'DELETE' }); custom = custom.filter(memory => memory.id !== item.id); favorites.delete(item.id);
           if (blobURLs.has(item.id)) { URL.revokeObjectURL(blobURLs.get(item.id)); blobURLs.delete(item.id); }
-          $('#detail-dialog').close(); renderGallery(); toast('已从这台设备删除回忆。');
+          $('#detail-dialog').close(); renderGallery(); renderMigration(); await refreshStorage(); toast('已从云端删除回忆，所有设备将同步更新。');
         } catch (error) { toast(error.message); remove.disabled = false; }
       }); actions.append(remove);
     }
@@ -229,7 +341,7 @@
     const form = $('#profile-form'); if (!form) return;
     form.elements.names.value = typeof profile.names === 'string' ? profile.names : '';
     form.elements.start.value = validDate(profile.start) ? profile.start : '';
-    form.elements.start.max = today(); $('#profile-dialog').showModal();
+    form.elements.start.max = today(); const error = $('#profile-error'); if (error) { error.hidden = true; error.textContent = ''; } $('#profile-dialog').showModal();
   }
   function updateMediaField() {
     const form = $('#memory-form'); if (!form) return;
@@ -241,7 +353,7 @@
   }
   function openAdd() {
     const form = $('#memory-form'); if (!form) return;
-    form.reset(); form.elements.date.value = today(); form.elements.date.max = today();
+    form.reset(); form.dataset.pendingId = `m-${crypto.randomUUID()}`; form.elements.date.value = today(); form.elements.date.max = today();
     const error = $('#add-error'); if (error) { error.textContent = ''; error.hidden = true; } updateMediaField(); $('#add-dialog').showModal();
   }
   $$('.filter-btn').forEach(button => button.addEventListener('click', () => { filter = button.dataset.filter || 'all'; renderGallery(); }));
@@ -268,10 +380,11 @@
     const kind = form.elements.type.value; const title = form.elements.title.value.trim(); const text = form.elements.text.value.trim(); const date = form.elements.date.value;
     const save = $('#memory-save');
     try {
+      requireCloud();
       if (!KINDS.includes(kind) || !title || title.length > 100) throw new Error('请填写 1–100 字的回忆标题。');
       if (!validDate(date) || date > today()) throw new Error('请选择今天或过去的真实日期。');
       if (text.length > 10000) throw new Error('这段心情有点长，请控制在 10000 字以内。');
-      const item = { id: `m-${crypto.randomUUID()}`, type: kind, title, text, date, location: '我们的日常', createdAt: new Date().toISOString() };
+      const item = { id: form.dataset.pendingId || `m-${crypto.randomUUID()}`, type: kind, title, text, date, location: '我们的日常', createdAt: new Date().toISOString() };
       if (kind === 'photo' || kind === 'video') {
         const file = form.elements.file.files[0];
         if (!file) throw new Error(kind === 'photo' ? '请选择一张照片。' : '请选择一段视频。');
@@ -280,18 +393,23 @@
         item.blob = file; item.filename = file.name;
       } else if (!text) throw new Error('写下一点内容，再把它收藏起来吧。');
       if (save) { save.disabled = true; save.textContent = '正在收藏…'; }
-      await saveStored([item]); custom.unshift(item); filter = 'all'; favoriteOnly = false; search = ''; if ($('#search-input')) $('#search-input').value = '';
-      renderGallery(); $('#add-dialog').close(); toast('已收藏在这台设备。记得定期导出备份。'); $('#memories')?.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
+      await uploadMemory(item); filter = 'all'; favoriteOnly = false; search = ''; if ($('#search-input')) $('#search-input').value = '';
+      renderGallery(); renderMigration(); $('#add-dialog').close(); await refreshStorage(); toast('已收藏到私有云端，其他设备登录后也能看到。'); $('#memories')?.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
     } catch (error) { if (errorNode) { errorNode.textContent = error.message || '保存失败，请重试。'; errorNode.hidden = false; } else toast(error.message); }
     finally { if (save) { save.disabled = false; save.textContent = '收藏这份回忆'; } }
   });
-  $('#profile-form')?.addEventListener('submit', event => {
+  $('#profile-form')?.addEventListener('submit', async event => {
     event.preventDefault(); const form = event.currentTarget; const names = form.elements.names.value.trim(); const start = form.elements.start.value;
-    if (names.length > 40) { toast('两个人的昵称请控制在 40 字以内。'); return; }
-    if (start && (!validDate(start) || start > today())) { toast('纪念日请选择今天或过去的日期。'); return; }
-    const next = { names, start };
-    try { localStorage.setItem(STORAGE.profile, JSON.stringify(next)); profile = next; updateProfile(); $('#profile-dialog').close(); toast('我们的专属设置已保存在这台设备。'); }
-    catch { toast('保存设置失败，请检查浏览器存储权限。'); }
+    const errorNode = $('#profile-error'); if (errorNode) { errorNode.hidden = true; errorNode.textContent = ''; }
+    const save = form.querySelector('button[type="submit"]'); if (save) save.disabled = true;
+    try {
+      requireCloud();
+      if (!names || names.length > 40) throw new Error('请填写 1–40 字的昵称。');
+      if (start && (!validDate(start) || start > today())) throw new Error('纪念日请选择今天或过去的日期。');
+      await saveProfile({ names, start }); renderMigration(); $('#profile-dialog').close(); toast('我们的专属设置已保存在云端。');
+    } catch (error) {
+      if (errorNode) { errorNode.textContent = error.message; errorNode.hidden = false; } else toast(error.message);
+    } finally { if (save) save.disabled = false; }
   });
   const menuToggle = $('#menu-toggle');
   menuToggle?.addEventListener('click', () => { const expanded = menuToggle.getAttribute('aria-expanded') !== 'true'; menuToggle.setAttribute('aria-expanded', String(expanded)); $('#main-nav')?.classList.toggle('is-open', expanded); });
@@ -303,57 +421,77 @@
   });
 
   function blobToDataURL(blob) { return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = () => reject(new Error('读取媒体文件失败。')); reader.readAsDataURL(blob); }); }
+  async function downloadBackup(items, backupProfile, backupFavorites, suffix = '') {
+    const memories = [];
+    for (const item of items) {
+      const { blob, src, poster, ...rest } = item;
+      let media = blob;
+      if (!media && (item.type === 'photo' || item.type === 'video')) {
+        if (typeof src !== 'string' || !src.startsWith('/api/media/')) throw new Error('媒体地址不符合云端回忆格式，导出已停止。');
+        const response = await fetch(src, { credentials: 'same-origin', cache: 'no-store' });
+        if (!response.ok || !(response.headers.get('content-type') || '').match(/^(image|video)\//)) throw new Error(`无法下载「${item.title}」的媒体文件，导出未完成。`);
+        media = await response.blob();
+      }
+      memories.push({ ...rest, ...(media ? { media: await blobToDataURL(media) } : {}) });
+    }
+    const payload = { application: 'taffy-memories', version: 1, exportedAt: new Date().toISOString(), profile: backupProfile, favorites: [...backupFavorites], memories };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }));
+    const link = el('a'); link.href = url; link.download = `我们的回忆册${suffix}-${today()}.json`; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
   $('#export-backup')?.addEventListener('click', async event => {
     const button = event.currentTarget; button.disabled = true;
     try {
-      // Read again so export includes records saved in another open tab.
-      const items = await getStored();
-      const memories = await Promise.all(items.map(async item => { const { blob, ...rest } = item; return { ...rest, ...(blob ? { media: await blobToDataURL(blob) } : {}) }; }));
-      const payload = { application: 'taffy-memories', version: 1, exportedAt: new Date().toISOString(), profile, favorites: [...favorites], memories };
-      const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }));
-      const link = el('a'); link.href = url; link.download = `我们的回忆册-${today()}.json`; document.body.append(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000); toast('备份已生成，请妥善保存下载的文件。');
+      requireCloud(); await loadCloud({ silent: true }); requireCloud();
+      await downloadBackup(custom, profile, favorites); toast('云端回忆备份已生成，包含照片与视频，请妥善保存。');
     } catch (error) { toast(error.message || '导出失败，请重试。'); } finally { button.disabled = false; }
+  });
+  $('#migration-export-local')?.addEventListener('click', async event => {
+    const button = event.currentTarget; button.disabled = true;
+    try { await downloadBackup(await getStored(), localProfile, localFavorites, '-本机原件'); toast('本机旧版备份已生成，原件仍保留。'); }
+    catch (error) { toast(error.message || '本机备份导出失败。'); } finally { button.disabled = false; }
   });
   $('#import-backup')?.addEventListener('click', () => $('#backup-file')?.click());
   $('#backup-file')?.addEventListener('change', async event => {
     const input = event.currentTarget; const file = input.files[0]; if (!file) return;
+    let saved = 0;
     try {
-      if (file.size > 150 * 1024 * 1024) throw new Error('备份超过 150 MB，请分批恢复。');
+      requireCloud();
+      if (file.size > 150 * 1024 * 1024) throw new Error('备份超过 150 MB，请选择分批保存的备份。');
       const backup = JSON.parse(await file.text());
       if (backup.application !== 'taffy-memories' || backup.version !== 1 || !Array.isArray(backup.memories) || backup.memories.length > 2000) throw new Error('这不是有效的回忆册备份文件。');
       const items = [];
       for (const raw of backup.memories) {
-        if (!raw || typeof raw !== 'object' || typeof raw.id !== 'string' || !/^m-[a-zA-Z0-9-]{1,90}$/.test(raw.id) || !KINDS.includes(raw.type) || typeof raw.title !== 'string' || !raw.title.trim() || raw.title.length > 100 || typeof raw.text !== 'string' || raw.text.length > 10000 || !validDate(raw.date) || raw.date > today()) throw new Error('备份中的回忆格式有误，未导入任何内容。');
+        if (!validMemory(raw) || !raw.title.trim() || raw.title.length > 100 || raw.text.length > 10000 || raw.date > today()) throw new Error('备份中的回忆格式有误，未开始导入。');
         const item = { id: raw.id, type: raw.type, title: raw.title, text: raw.text, date: raw.date, location: typeof raw.location === 'string' ? raw.location.slice(0, 100) : '我们的日常' };
         if (raw.type === 'photo' || raw.type === 'video') {
-          if (typeof raw.media !== 'string') throw new Error('备份中缺少媒体文件。');
+          if (typeof raw.media !== 'string') throw new Error('备份中缺少媒体文件，未开始导入。');
           const match = /^data:([a-z0-9/+.-]+);base64,([a-zA-Z0-9+/=]+)$/.exec(raw.media);
-          if (!match || !(raw.type === 'photo' ? PHOTO_TYPES : VIDEO_TYPES).includes(match[1]) || match[2].length > Math.ceil(MAX_FILE * 4 / 3) + 4) throw new Error('备份中的媒体格式或大小不受支持。');
+          if (!match || !(raw.type === 'photo' ? PHOTO_TYPES : VIDEO_TYPES).includes(match[1]) || match[2].length > Math.ceil(MAX_FILE * 4 / 3) + 4) throw new Error('备份中的媒体格式或大小不受支持，未开始导入。');
           const binary = atob(match[2]); const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
-          if (bytes.byteLength > MAX_FILE) throw new Error('备份中的单个文件超过 30 MB。');
+          if (bytes.byteLength > MAX_FILE) throw new Error('备份中的单个文件超过 30 MB，未开始导入。');
           item.blob = new Blob([bytes], { type: match[1] }); item.filename = typeof raw.filename === 'string' ? raw.filename.slice(0, 255) : 'memory';
-        }
+        } else if (!item.text.trim()) throw new Error('备份中的文字回忆为空，未开始导入。');
         items.push(item);
       }
-      await saveStored(items); custom = await getStored();
-      for (const url of blobURLs.values()) URL.revokeObjectURL(url); blobURLs.clear();
-      let settingsSaved = true;
-      try {
-        if (backup.profile && typeof backup.profile === 'object') {
-          const next = { names: typeof backup.profile.names === 'string' ? backup.profile.names.slice(0, 40) : '', start: validDate(backup.profile.start) && backup.profile.start <= today() ? backup.profile.start : '' };
-          localStorage.setItem(STORAGE.profile, JSON.stringify(next)); profile = next;
-        }
-        if (Array.isArray(backup.favorites)) { const next = new Set([...favorites, ...backup.favorites.filter(value => typeof value === 'string' && value.length < 100)]); localStorage.setItem(STORAGE.favorites, JSON.stringify([...next])); favorites = next; }
-      } catch { settingsSaved = false; }
-      renderGallery(); updateProfile(); toast(`已恢复 ${items.length} 条回忆${settingsSaved ? '，保存在这台设备。' : '；昵称和喜欢未能恢复，请检查存储权限。'}`);
-    } catch (error) { toast(error instanceof SyntaxError ? '无法解析备份，请选择原始 JSON 备份文件。' : error.message || '导入失败，请重试。'); }
-    finally { input.value = ''; }
+      const importButton = $('#import-backup'); if (importButton) importButton.disabled = true;
+      for (const item of items) { await uploadMemory(item); saved++; }
+      if (backup.profile && typeof backup.profile === 'object' && typeof backup.profile.names === 'string' && backup.profile.names.trim()) {
+        await saveProfile({ names: backup.profile.names.slice(0, 40), start: validDate(backup.profile.start) && backup.profile.start <= today() ? backup.profile.start : '' });
+      }
+      if (Array.isArray(backup.favorites)) for (const id of new Set(backup.favorites.filter(id => typeof id === 'string' && /^(m-[a-zA-Z0-9-]{1,90}|s[1-6])$/.test(id)))) if (!favorites.has(id)) await saveFavorite(id, true);
+      renderGallery(); updateProfile(); renderMigration(); await refreshStorage(); toast(`已将 ${saved} 条回忆恢复到云端，其他设备登录后即可查看。`);
+    } catch (error) {
+      renderGallery(); renderMigration();
+      const message = error instanceof SyntaxError ? '无法解析备份，请选择原始 JSON 备份文件。' : error.message || '导入失败，请重试。';
+      toast(`${saved ? `本次已保存 ${saved} 条。` : ''}${message}${saved ? ' 可用同一备份重试，已保存的回忆不会重复创建。' : ''}`);
+    } finally { input.value = ''; const button = $('#import-backup'); if (button) button.disabled = false; }
   });
+  $('#cloud-refresh')?.addEventListener('click', () => loadCloud().catch(() => {}));
+  $('#migrate-local')?.addEventListener('click', migrateLocal);
 
-  updateProfile(); renderGallery();
-  getStored().then(items => { custom = items.filter(item => item && KINDS.includes(item.type) && validDate(item.date) && typeof item.title === 'string'); renderGallery(); }).catch(error => { toast(error.message); });
-  window.addEventListener('storage', event => {
-    if (event.key === STORAGE.favorites) { const next = readLocal(STORAGE.favorites, []); favorites = new Set(Array.isArray(next) ? next.filter(x => typeof x === 'string') : []); renderGallery(); }
-    if (event.key === STORAGE.profile) { const next = readLocal(STORAGE.profile, {}); profile = next && typeof next === 'object' ? next : {}; updateProfile(); }
+  updateProfile(); renderGallery(); paintStorage();
+  getStored().then(items => { localItems = items.filter(validMemory); renderMigration(); }).catch(error => {
+    const message = $('#migration-error'); if (message) { message.hidden = false; message.textContent = error.message; }
   });
+  loadCloud({ silent: true }).catch(() => {});
 })();

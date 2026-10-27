@@ -1,0 +1,14 @@
+{
+  "name": "taffy-memories",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "db:generate": "drizzle-kit generate",
+    "dev": "node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js dev --config wrangler.local.jsonc --local --ip 127.0.0.1 --port 4173 --persist-to .wrangler/state",
+    "db:local": "node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 migrations apply DB --local --config wrangler.local.jsonc --persist-to .wrangler/state",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {"drizzle-orm": "0.45.2"},
+  "devDependencies": {"drizzle-kit": "0.31.10", "wrangler": "4.92.0"}
+}
