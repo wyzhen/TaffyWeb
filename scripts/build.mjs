@@ -19,7 +19,7 @@ for (const [file, mime] of [
 }
 assets['/index.html'] = assets['/'];
 const api = (await readFile(resolve(root,'worker/api.js'),'utf8')).replace('export async function api(', 'async function api(');
-const entry = (await readFile(resolve(root,'worker/index.js'),'utf8')).replace("import { api } from './api.js';",'').replace('__TAFFY_ASSETS__',JSON.stringify(assets));
+const entry = (await readFile(resolve(root,'worker/index.js'),'utf8')).replace("import { api } from './api.js';",'').replace('__TAFFY_ASSETS__',() => JSON.stringify(assets));
 const bundled = api + '\n' + entry;
 const manifest = JSON.parse(await readFile(resolve(root,'.openai/hosting.json'),'utf8'));
 assert.equal(manifest.project_id, 'appgprj_6ae0bdb36abc81918694ab8e52e6be81');
@@ -33,4 +33,6 @@ await cp(resolve(root,'drizzle'),resolve(out,'drizzle'),{recursive:true});
 // Dynamic import uses ESM regardless of the output directory's package state.
 const module = await import(`data:text/javascript;base64,${Buffer.from(bundled).toString('base64')}`);
 assert.equal(typeof module.default.fetch,'function');
+const servedScript = await module.default.fetch(new Request('https://build.test/app.js'),{});
+assert.equal(await servedScript.text(),assets['/app.js'].text,'Bundling must preserve the browser script byte for byte');
 console.log('Built and validated Sites Worker ESM artifact:',out);
