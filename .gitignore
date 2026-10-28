@@ -6,4 +6,5 @@ node_modules/
 .sites-runtime/
 outputs/
 .env*
+!.env.example
 .dev.vars*

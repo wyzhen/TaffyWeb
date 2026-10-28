@@ -20,7 +20,7 @@ function formFor(item, blob, filename) {
 test('cloud album survives fresh clients and runtime restarts with real D1 and R2', {timeout:180000}, async t => {
   const state = await mkdtemp(join(tmpdir(), 'taffy-cloud-test-'));
   const options = {modules:true, scriptPath:join(root, 'test/qa-worker.mjs'), modulesRoot:root, modulesRules:[{type:'ESModule',include:['**/*.js'],fallthrough:true}],
-    compatibilityDate:'2026-05-01', d1Databases:{DB:'taffy-test-db'}, r2Buckets:['BUCKET'],
+    bindings:{OWNER_EMAIL:'owner@taffy.local'}, compatibilityDate:'2026-05-01', d1Databases:{DB:'taffy-test-db'}, r2Buckets:['BUCKET'],
     d1Persist:join(state,'d1'), r2Persist:join(state,'r2')};
   let mf = new Miniflare(options);
   const request = async (path, options = {}) => {
@@ -28,7 +28,7 @@ test('cloud album survives fresh clients and runtime restarts with real D1 and R
       const encoded = new Request(origin + path, options);
       options = {...options, headers:Object.fromEntries(encoded.headers), body:Buffer.from(await encoded.arrayBuffer())};
     }
-    return mf.dispatchFetch(origin + path, options);
+    return mf.dispatchFetch(origin + path, {...options,headers:{'oai-authenticated-user-id':'test-owner','oai-authenticated-user-email':'owner@taffy.local',...options.headers}});
   };
   const json = async (path, options) => { const response = await request(path, options); const body = await response.json(); return {response,body}; };
   const post = (item, blob, filename) => json('/api/memories',{method:'POST',body:formFor(item,blob,filename)});

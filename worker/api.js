@@ -26,6 +26,28 @@ function checkWriteOrigin(request) {
 function requireStorage(env) {
   if (!env.DB?.prepare || !env.BUCKET?.put) fail(503, '云端存储尚未连接，请稍后重试。');
 }
+async function access(request, env) {
+  // These identity headers are verified and injected by Sites dispatch, never
+  // supplied by application JavaScript. Email anchors the very first owner
+  // login; all subsequent authorization uses the immutable Site-scoped user ID.
+  const id = request.headers.get('oai-authenticated-user-id');
+  if (!id) return {authenticated:false,canWrite:false};
+  let owner = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('owner-user-id').first();
+  if (!owner) {
+    const email = request.headers.get('oai-authenticated-user-email')?.trim().toLowerCase();
+    const expected = typeof env.OWNER_EMAIL === 'string' ? env.OWNER_EMAIL.trim().toLowerCase() : '';
+    if (expected && email === expected) {
+      await env.DB.prepare('INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO NOTHING').bind('owner-user-id',id).run();
+      owner = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('owner-user-id').first();
+    }
+  }
+  return {authenticated:true,canWrite:owner?.value === id};
+}
+async function requireOwner(request, env) {
+  const permission = await access(request,env);
+  if (!permission.authenticated) fail(401, '访客只能查看回忆，请先以站点主人账号登录。');
+  if (!permission.canWrite) fail(403, '这个账号只有查看权限，只有站点主人可以修改回忆。');
+}
 async function bodyJSON(request, limit = 16384) {
   if (!request.headers.get('content-type')?.includes('application/json')) fail(415, '请使用 JSON 提交设置。');
   // JSON is only used for the small profile/favorite settings, never for media.
@@ -55,14 +77,14 @@ async function storage(env) {
     limitsNote:'数据库每站最多 10 GB；照片与视频未设固定的单站容量上限，仍受账号共享使用与存储限制约束。平台未提供账号剩余共享配额的查询接口。',
     measuredAt:new Date().toISOString()};
 }
-async function list(env) {
-  const [rows, profile, likes, usage] = await Promise.all([
+async function list(env, request) {
+  const [rows, profile, likes, usage, permission] = await Promise.all([
     env.DB.prepare('SELECT * FROM memories ORDER BY memory_date DESC, id DESC').all(),
     env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind('profile').first(),
-    env.DB.prepare('SELECT memory_id FROM favorites').all(),storage(env),
+    env.DB.prepare('SELECT memory_id FROM favorites').all(),storage(env),access(request,env),
   ]);
   let savedProfile = {}; try {savedProfile = JSON.parse(profile?.value || '{}');} catch {}
-  return json({memories:rows.results.map(record),profile:savedProfile,favorites:likes.results.map(row => row.memory_id),storage:usage});
+  return json({memories:rows.results.map(record),profile:savedProfile,favorites:likes.results.map(row => row.memory_id),storage:usage,permission});
 }
 async function upload(request, env) {
   if (!request.headers.get('content-type')?.includes('multipart/form-data')) fail(415, '请以表单方式提交回忆。');
@@ -296,15 +318,18 @@ async function favorite(request, env, id) {
   return json({liked:body.liked});
 }
 
-// All API and media routes are behind the unchanged owner-private Sites access
-// boundary. Dispatch consumes service authorization; it may supply no user header.
-// Do not make this shared album public without adding application authorization.
+// Sharing permits reads; every write independently requires the Site owner's
+// verified identity. A service access token alone never grants edit permission.
 export async function api(request, env) {
   try {
     requireStorage(env);
     const path = new URL(request.url).pathname;
-    if (!['GET','HEAD'].includes(request.method)) checkWriteOrigin(request);
-    if (path === '/api/memories' && request.method === 'GET') return await list(env);
+    if (!['GET','HEAD'].includes(request.method)) {
+      checkWriteOrigin(request);
+      await requireOwner(request,env);
+    }
+    if (path === '/api/session' && request.method === 'GET') return json(await access(request,env));
+    if (path === '/api/memories' && request.method === 'GET') return await list(env,request);
     if (path === '/api/memories' && request.method === 'POST') return await upload(request,env);
     if (path === '/api/video-uploads' && request.method === 'POST') return await startVideo(request,env);
     if (path === '/api/storage' && request.method === 'GET') return json(await storage(env));

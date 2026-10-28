@@ -2,6 +2,7 @@
   "name": "taffy-memories-local",
   "main": "outputs/site/server/index.js",
   "compatibility_date": "2026-01-01",
+  "vars": {"OWNER_EMAIL":"owner@taffy.local"},
   "d1_databases": [{"binding":"DB","database_name":"taffy-local","database_id":"local-taffy-memories","migrations_dir":"drizzle"}],
   "r2_buckets": [{"binding":"BUCKET","bucket_name":"taffy-local-media"}]
 }

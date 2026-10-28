@@ -14,9 +14,9 @@ const metadata = (id,size,extra = {}) => ({id,title:'一段很长的夏日影像
 test('large videos use bounded persistent R2 multipart uploads', {timeout:180000}, async t => {
   const state = await mkdtemp(join(tmpdir(),'taffy-video-test-'));
   const options = {modules:true,scriptPath:join(root,'test/qa-worker.mjs'),modulesRoot:root,modulesRules:[{type:'ESModule',include:['**/*.js'],fallthrough:true}],
-    compatibilityDate:'2026-05-01',d1Databases:{DB:'taffy-video-db'},r2Buckets:['BUCKET'],d1Persist:join(state,'d1'),r2Persist:join(state,'r2')};
+    bindings:{OWNER_EMAIL:'owner@taffy.local'}, compatibilityDate:'2026-05-01',d1Databases:{DB:'taffy-video-db'},r2Buckets:['BUCKET'],d1Persist:join(state,'d1'),r2Persist:join(state,'r2')};
   let mf = new Miniflare(options);
-  const request = (path,options = {}) => mf.dispatchFetch(origin+path,options);
+  const request = (path,options = {}) => mf.dispatchFetch(origin+path,{...options,headers:{'oai-authenticated-user-id':'test-owner','oai-authenticated-user-email':'owner@taffy.local',...options.headers}});
   const json = async (path,options) => {const response = await request(path,options);return {response,body:await response.json()};};
   const init = item => json('/api/video-uploads',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(item)});
   const part = (id,index,bytes) => json(`/api/video-uploads/${id}/parts/${index}`,{method:'PUT',body:bytes});
