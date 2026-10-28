@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, index } from 'drizzle-orm/sqlite-core';
+import { sqliteTable, text, integer, index, primaryKey } from 'drizzle-orm/sqlite-core';
 
 export const memories = sqliteTable('memories', {
   id: text('id').primaryKey(),
@@ -22,3 +22,20 @@ export const settings = sqliteTable('settings', {
 export const favorites = sqliteTable('favorites', {
   memoryId: text('memory_id').primaryKey(),
 });
+
+export const videoUploads = sqliteTable('video_uploads', {
+  memoryId: text('memory_id').primaryKey(),
+  objectKey: text('object_key').notNull(),
+  uploadId: text('upload_id').notNull(),
+  metadata: text('metadata').notNull(),
+  byteSize: integer('byte_size').notNull(),
+  createdAt: text('created_at').notNull(),
+  expiresAt: text('expires_at').notNull(),
+}, table => [index('video_uploads_expiry_idx').on(table.expiresAt)]);
+
+export const videoUploadParts = sqliteTable('video_upload_parts', {
+  memoryId: text('memory_id').notNull(),
+  partNumber: integer('part_number').notNull(),
+  etag: text('etag').notNull(),
+  byteSize: integer('byte_size').notNull(),
+}, table => [primaryKey({columns:[table.memoryId, table.partNumber]})]);

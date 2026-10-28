@@ -3,7 +3,9 @@
 
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
-  const MAX_FILE = 30 * 1024 * 1024;
+  const MAX_PHOTO = 30 * 1024 * 1024;
+  const MAX_VIDEO = 1024 * 1024 * 1024;
+  const MAX_JSON_MEDIA = 90 * 1024 * 1024;
   const PHOTO_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif'];
   const VIDEO_TYPES = ['video/mp4', 'video/webm', 'video/quicktime', 'video/ogg'];
   const KINDS = ['photo', 'video', 'note', 'chat'];
@@ -31,6 +33,8 @@
   let search = '';
   let currentId = null;
   let toastTimer;
+  let activeVideoUpload = null;
+  let draftUpload = null;
   const blobURLs = new Map();
   function readLocal(key, fallback) {
     try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
@@ -98,23 +102,31 @@
   }
   async function api(path, options = {}) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 120000);
+    const { timeoutMs = 120000, signal, ...fetchOptions } = options;
+    const externalAbort = () => controller.abort();
+    if (signal?.aborted) controller.abort();
+    signal?.addEventListener('abort',externalAbort,{once:true});
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetch(path, { credentials: 'same-origin', cache: 'no-store', ...options, signal: controller.signal });
+      const response = await fetch(path, { credentials: 'same-origin', cache: 'no-store', ...fetchOptions, signal: controller.signal });
       const contentType = response.headers.get('content-type') || '';
       let data = null;
       if (contentType.includes('application/json')) data = await response.json();
       if (!response.ok) {
         const message = typeof data?.error === 'string' ? data.error : typeof data?.message === 'string' ? data.message : '';
-        throw new Error(message || (response.status === 401 || response.status === 403 ? '请确认已登录这个私有网站，然后刷新重试。' : `云端请求未完成（${response.status}），请稍后重试。`));
+        const error = new Error(message || (response.status === 401 || response.status === 403 ? '请确认已登录这个私有网站，然后刷新重试。' : `云端请求未完成（${response.status}），请稍后重试。`));
+        error.status = response.status; throw error;
       }
       if (!data || typeof data !== 'object') throw new Error('云端没有返回有效数据，请重新登录或刷新重试。');
       return data;
     } catch (error) {
-      if (error.name === 'AbortError') throw new Error('连接云端超时，内容尚未确认保存。请检查网络后重试。');
+      if (error.name === 'AbortError') {
+        if (signal?.aborted) throw error;
+        throw new Error('连接云端超时，内容尚未确认保存。请检查网络后重试。');
+      }
       if (error instanceof TypeError) throw new Error('暂时无法连接云端，请检查网络后重试。');
       throw error;
-    } finally { clearTimeout(timeout); }
+    } finally { clearTimeout(timeout); signal?.removeEventListener('abort',externalAbort); }
   }
   const jsonOptions = (value) => ({ method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(value) });
   function requireCloud() {
@@ -137,7 +149,7 @@
     const db = $('#cloud-db-limit'); if (db) db.textContent = '每个站点上限 10 GB';
     const file = $('#cloud-file-limit'); if (file) file.textContent = '每个站点未设固定容量上限';
     const account = $('#cloud-account-remaining'); if (account) account.textContent = '平台未提供查询';
-    const max = $('#cloud-max-file'); if (max) max.textContent = '单个文件最大 30 MB';
+    const max = $('#cloud-max-file'); if (max) max.textContent = '照片 30 MB · 视频 1024 MB';
   }
   function cloudStatus(state, message) {
     const status = $('#cloud-status');
@@ -182,11 +194,68 @@
     try { paintStorage(await api('/api/storage')); }
     catch (error) { cloudStatus('error', `回忆操作已完成，但用量刷新失败：${error.message}`); }
   }
+  function videoProgress(sent, total, message = '') {
+    const panel = $('#video-upload-progress'); if (panel) panel.hidden = false;
+    const meter = $('#video-upload-meter'); if (meter) {meter.max = total; meter.value = sent;}
+    const label = $('#video-upload-label');
+    if (label) label.textContent = message || `视频上传 ${Math.floor(sent / total * 100)}% · ${(sent / 1024 / 1024).toFixed(1)} / ${(total / 1024 / 1024).toFixed(1)} MB`;
+    const note = $('#cloud-status-note'); if (note) note.textContent = message || `正在上传视频（${Math.floor(sent / total * 100)}%），请保持页面打开。`;
+  }
+  async function retryVideoRequest(path, options, signal) {
+    for (let attempt = 0; ; attempt++) {
+      if (signal.aborted) throw new DOMException('已取消上传','AbortError');
+      try {return await api(path,{...options,signal,timeoutMs:300000});}
+      catch (error) {
+        if (signal.aborted || attempt >= 3 || (error.status && error.status < 500 && ![408,429].includes(error.status))) throw error;
+        await new Promise(resolve => setTimeout(resolve,Math.min(4000,1000 * 2 ** attempt)));
+      }
+    }
+  }
+  async function uploadVideo(item) {
+    if (activeVideoUpload) throw new Error('已有视频正在上传，请稍后再试。');
+    if (!item.blob?.size || item.blob.size > MAX_VIDEO) throw new Error('单个视频最大 1024 MB，且不能为空。');
+    if (!VIDEO_TYPES.includes(item.blob.type)) throw new Error('视频格式暂不支持。');
+    const controller = new AbortController();
+    activeVideoUpload = {controller,id:item.id};
+    const cancel = $('#cancel-video-upload'); if (cancel) cancel.disabled = false;
+    videoProgress(0,item.blob.size);
+    try {
+      const init = await retryVideoRequest('/api/video-uploads',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:item.id,title:item.title,date:item.date,text:item.text,filename:item.filename || 'video',mime:item.blob.type,byteSize:item.blob.size})},controller.signal);
+      if (init.memory) return init;
+      if (init.id !== item.id || init.partSize !== 8 * 1024 * 1024 || init.partCount !== Math.ceil(item.blob.size / init.partSize) || !Array.isArray(init.uploadedParts)) throw new Error('云端分片配置异常，请刷新后重试。');
+      const uploaded = new Set(init.uploadedParts);
+      let sent = 0;
+      for (let part = 1; part <= init.partCount; part++) {
+        const offset = (part - 1) * init.partSize;
+        const chunk = item.blob.slice(offset,Math.min(offset + init.partSize,item.blob.size));
+        if (!uploaded.has(part)) await retryVideoRequest(`/api/video-uploads/${encodeURIComponent(item.id)}/parts/${part}`,{method:'PUT',headers:{'content-type':'application/octet-stream'},body:chunk},controller.signal);
+        sent += chunk.size; videoProgress(sent,item.blob.size);
+      }
+      if (cancel) cancel.disabled = true;
+      videoProgress(sent,item.blob.size,'分片已传完，正在确认云端保存…');
+      return await retryVideoRequest(`/api/video-uploads/${encodeURIComponent(item.id)}/complete`,{method:'POST'},controller.signal);
+    } catch (error) {
+      if (controller.signal.aborted) {
+        try {await api(`/api/video-uploads/${encodeURIComponent(item.id)}`,{method:'DELETE'});}
+        catch {throw new Error('已停止传输，未完成分片将在过期后清理。');}
+        throw new Error('已取消视频上传，未保存为回忆。');
+      }
+      throw error;
+    } finally {
+      activeVideoUpload = null;
+      const panel = $('#video-upload-progress'); if (panel) panel.hidden = true;
+      cloudStatus(cloudReady ? 'ready' : 'error');
+    }
+  }
   async function uploadMemory(item) {
-    const data = new FormData();
-    for (const key of ['id', 'type', 'title', 'date', 'text', 'location']) if (typeof item[key] === 'string') data.set(key, item[key]);
-    if (item.blob) data.set('file', item.blob, item.filename || 'memory');
-    const response = await api('/api/memories', { method: 'POST', body: data });
+    let response;
+    if (item.type === 'video') response = await uploadVideo(item);
+    else {
+      const data = new FormData();
+      for (const key of ['id', 'type', 'title', 'date', 'text', 'location']) if (typeof item[key] === 'string') data.set(key, item[key]);
+      if (item.blob) data.set('file', item.blob, item.filename || 'memory');
+      response = await api('/api/memories', { method: 'POST', body: data });
+    }
     if (!validMemory(response.memory)) throw new Error('云端未确认这条回忆，暂不标记为已保存。请刷新查看后重试。');
     const existing = custom.findIndex(memory => memory.id === response.memory.id);
     if (existing === -1) custom.push(response.memory); else custom[existing] = response.memory;
@@ -301,6 +370,10 @@
     if (item.type === 'chat') copy.append(chatPreview(item.text, true)); else copy.append(el('p', 'detail-text', item.text));
     const actions = el('div', 'detail-actions'); actions.append(favoriteButton(item));
     if (!item.sample) {
+      if (item.src && (item.type === 'photo' || item.type === 'video')) {
+        const download = el('a','text-button','下载原文件');
+        download.href = item.src + '?download=1'; download.download = item.filename || 'memory'; actions.append(download);
+      }
       const remove = el('button', 'text-button delete-memory', '删除这条回忆'); remove.type = 'button';
       remove.addEventListener('click', async () => {
         if (!window.confirm('确定从云端删除这条回忆和媒体文件吗？所有设备都会同步删除，建议先导出备份。')) return;
@@ -348,10 +421,12 @@
     const kind = form.elements.type.value; const needsFile = kind === 'photo' || kind === 'video';
     const field = $('#media-field'); if (field) field.hidden = !needsFile;
     form.elements.file.required = needsFile; form.elements.file.accept = kind === 'photo' ? PHOTO_TYPES.join(',') : VIDEO_TYPES.join(',');
-    const help = $('#file-help'); if (help) help.textContent = kind === 'video' ? '支持 MP4、WebM、MOV；建议 MP4（H.264），最大 30 MB。' : '支持 JPG、PNG、WebP、GIF、AVIF，最大 30 MB。';
+    const help = $('#file-help'); if (help) help.textContent = kind === 'video' ? '支持 MP4、WebM、MOV；建议 MP4（H.264），最大 1024 MB，上传时显示进度。' : '支持 JPG、PNG、WebP、GIF、AVIF，最大 30 MB。';
     form.elements.text.placeholder = kind === 'chat' ? '我：今天的晚霞很好看。\n你：和你一起看就更好了。' : '记下当时的小心情，未来的我们会很喜欢。';
   }
   function openAdd() {
+    if (activeVideoUpload) {if (!$('#add-dialog').open) $('#add-dialog').showModal(); return;}
+    draftUpload = null;
     const form = $('#memory-form'); if (!form) return;
     form.reset(); form.dataset.pendingId = `m-${crypto.randomUUID()}`; form.elements.date.value = today(); form.elements.date.max = today();
     const error = $('#add-error'); if (error) { error.textContent = ''; error.hidden = true; } updateMediaField(); $('#add-dialog').showModal();
@@ -388,12 +463,16 @@
       if (kind === 'photo' || kind === 'video') {
         const file = form.elements.file.files[0];
         if (!file) throw new Error(kind === 'photo' ? '请选择一张照片。' : '请选择一段视频。');
-        if (file.size > MAX_FILE) throw new Error('文件超过 30 MB，请压缩后再试。');
+        if (file.size > (kind === 'video' ? MAX_VIDEO : MAX_PHOTO)) throw new Error(kind === 'video' ? '视频超过 1024 MB，请压缩后再试。' : '照片超过 30 MB，请压缩后再试。');
         if (!(kind === 'photo' ? PHOTO_TYPES : VIDEO_TYPES).includes(file.type)) throw new Error('文件格式暂不支持，请参考下方支持的格式。');
         item.blob = file; item.filename = file.name;
       } else if (!text) throw new Error('写下一点内容，再把它收藏起来吧。');
+      const draftKey = JSON.stringify([kind,title,date,text,item.filename,item.blob?.size,item.blob?.lastModified]);
+      if (draftUpload?.key === draftKey) item.id = draftUpload.id;
+      else draftUpload = {key:draftKey,id:item.id};
       if (save) { save.disabled = true; save.textContent = '正在收藏…'; }
       await uploadMemory(item); filter = 'all'; favoriteOnly = false; search = ''; if ($('#search-input')) $('#search-input').value = '';
+      draftUpload = null;
       renderGallery(); renderMigration(); $('#add-dialog').close(); await refreshStorage(); toast('已收藏到私有云端，其他设备登录后也能看到。'); $('#memories')?.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
     } catch (error) { if (errorNode) { errorNode.textContent = error.message || '保存失败，请重试。'; errorNode.hidden = false; } else toast(error.message); }
     finally { if (save) { save.disabled = false; save.textContent = '收藏这份回忆'; } }
@@ -422,6 +501,8 @@
 
   function blobToDataURL(blob) { return new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = () => reject(new Error('读取媒体文件失败。')); reader.readAsDataURL(blob); }); }
   async function downloadBackup(items, backupProfile, backupFavorites, suffix = '') {
+    const totalMedia = items.reduce((sum,item) => sum + (item.blob?.size || item.byteSize || 0),0);
+    if (totalMedia > MAX_JSON_MEDIA) throw new Error('媒体合计超过 JSON 备份的安全大小。请在回忆详情点击「下载原文件」单独备份较大的视频。');
     const memories = [];
     for (const item of items) {
       const { blob, src, poster, ...rest } = item;
@@ -466,9 +547,10 @@
         if (raw.type === 'photo' || raw.type === 'video') {
           if (typeof raw.media !== 'string') throw new Error('备份中缺少媒体文件，未开始导入。');
           const match = /^data:([a-z0-9/+.-]+);base64,([a-zA-Z0-9+/=]+)$/.exec(raw.media);
-          if (!match || !(raw.type === 'photo' ? PHOTO_TYPES : VIDEO_TYPES).includes(match[1]) || match[2].length > Math.ceil(MAX_FILE * 4 / 3) + 4) throw new Error('备份中的媒体格式或大小不受支持，未开始导入。');
+          const limit = raw.type === 'video' ? MAX_VIDEO : MAX_PHOTO;
+          if (!match || !(raw.type === 'photo' ? PHOTO_TYPES : VIDEO_TYPES).includes(match[1]) || match[2].length > Math.ceil(limit * 4 / 3) + 4) throw new Error('备份中的媒体格式或大小不受支持，未开始导入。');
           const binary = atob(match[2]); const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
-          if (bytes.byteLength > MAX_FILE) throw new Error('备份中的单个文件超过 30 MB，未开始导入。');
+          if (bytes.byteLength > limit) throw new Error(`备份中的${raw.type === 'video' ? '视频超过 1024 MB' : '照片超过 30 MB'}，未开始导入。`);
           item.blob = new Blob([bytes], { type: match[1] }); item.filename = typeof raw.filename === 'string' ? raw.filename.slice(0, 255) : 'memory';
         } else if (!item.text.trim()) throw new Error('备份中的文字回忆为空，未开始导入。');
         items.push(item);
@@ -488,6 +570,7 @@
   });
   $('#cloud-refresh')?.addEventListener('click', () => loadCloud().catch(() => {}));
   $('#migrate-local')?.addEventListener('click', migrateLocal);
+  $('#cancel-video-upload')?.addEventListener('click', () => activeVideoUpload?.controller.abort());
 
   updateProfile(); renderGallery(); paintStorage();
   getStored().then(items => { localItems = items.filter(validMemory); renderMigration(); }).catch(error => {
