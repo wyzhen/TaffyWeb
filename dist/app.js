@@ -36,6 +36,7 @@
   let toastTimer;
   let activeVideoUpload = null;
   let draftUpload = null;
+  let activePhotoViewer = null;
   const blobURLs = new Map();
   function readLocal(key, fallback) {
     try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; }
@@ -376,10 +377,133 @@
     $$('.filter-btn').forEach(button => { const active = button.dataset.filter === filter; button.classList.toggle('is-active', active); button.setAttribute('aria-pressed', String(active)); });
     const favorite = $('#favorites-only'); if (favorite) { favorite.setAttribute('aria-pressed', String(favoriteOnly)); favorite.classList.toggle('is-active', favoriteOnly); }
   }
+  function createPhotoViewer(item) {
+    const element = el('div','photo-viewer');
+    const viewport = el('div','photo-viewport');
+    viewport.tabIndex = 0; viewport.setAttribute('role','group');
+    viewport.setAttribute('aria-label','照片预览：加减键缩放，放大后方向键或拖动查看，0 键复位');
+    viewport.setAttribute('aria-busy','true');
+    const image = el('img','photo-zoom-image'); image.alt = item.title; image.draggable = false;
+    const error = el('p','photo-load-error','照片暂时无法加载，请稍后重试。'); error.hidden = true;
+    viewport.append(image,error);
+    const toolbar = el('div','photo-toolbar'); toolbar.setAttribute('role','group'); toolbar.setAttribute('aria-label','照片缩放');
+    const button = (action,label,text) => {
+      const node = el('button','photo-zoom-button',text);node.type = 'button';node.dataset.photoZoom = action;node.setAttribute('aria-label',label);return node;
+    };
+    const out = button('out','缩小照片','−');
+    const level = el('output','photo-zoom-level','100%');level.setAttribute('aria-live','polite');level.setAttribute('aria-label','照片缩放比例');
+    const inside = button('in','放大照片','＋');
+    const resetButton = button('reset','还原照片至适应窗口','复位');
+    const hint = el('span','photo-zoom-hint','双击 / 滚轮 / 双指缩放 · 放大后拖动');
+    toolbar.append(out,level,inside,resetButton,hint);element.append(viewport,toolbar);
+    let scale = 1, x = 0, y = 0, ready = false, destroyed = false, gesture = null, lastTap = null, touchToggleAt = 0, hadMultiplePointers = false;
+    const pointers = new Map(), listeners = [];
+    const clamp = (n,min,max) => Math.min(max,Math.max(min,n));
+    const point = (clientX,clientY) => {
+      const rect = viewport.getBoundingClientRect();return {x:clientX - rect.left - rect.width/2,y:clientY - rect.top - rect.height/2};
+    };
+    function paint() {
+      const limitX = Math.max(0,(image.clientWidth * scale - viewport.clientWidth)/2);
+      const limitY = Math.max(0,(image.clientHeight * scale - viewport.clientHeight)/2);
+      x = clamp(x,-limitX,limitX);y = clamp(y,-limitY,limitY);
+      image.style.transform = `translate3d(${x}px,${y}px,0) scale(${scale})`;
+      viewport.dataset.scale = scale.toFixed(4);viewport.dataset.offsetX = x.toFixed(2);viewport.dataset.offsetY = y.toFixed(2);
+      viewport.classList.toggle('is-zoomed',scale > 1.001);
+      const percent = `${Math.round(scale*100)}%`;if (level.textContent !== percent) level.textContent = percent;
+      out.disabled = !ready || scale <= 1.001;inside.disabled = !ready || scale >= 3.999;
+      resetButton.disabled = !ready || (scale <= 1.001 && Math.abs(x)<1 && Math.abs(y)<1);
+    }
+    function zoom(next,anchor = {x:0,y:0}) {
+      if (!ready || destroyed) return;
+      const value = clamp(next,1,4), ratio = value / scale;
+      x = anchor.x - (anchor.x - x)*ratio;y = anchor.y - (anchor.y - y)*ratio;scale = value;
+      if (scale <= 1.001) {scale = 1;x = 0;y = 0;}
+      paint();
+    }
+    function reset() {scale = 1;x = 0;y = 0;paint();}
+    function toggle(anchor) {if (scale > 1.001) reset();else zoom(2,anchor);}
+    function listen(node,type,handler,options) {
+      node.addEventListener(type,handler,options);listeners.push(() => node.removeEventListener(type,handler,options));
+    }
+    function beginGesture() {
+      const values = [...pointers.values()];
+      if (values.length >= 2) {
+        hadMultiplePointers = true;
+        const a = values[0], b = values[1];
+        gesture = {kind:'pinch',distance:Math.max(1,Math.hypot(a.x-b.x,a.y-b.y)),middle:point((a.x+b.x)/2,(a.y+b.y)/2),scale,x,y};
+        lastTap = null;
+      } else if (values.length === 1) {
+        gesture = {kind:'pan',start:values[0],x,y,at:Date.now(),moved:false,canTap:!hadMultiplePointers};
+      } else {gesture = null;hadMultiplePointers = false;}
+      viewport.classList.toggle('is-panning',values.length > 0 && scale > 1.001);
+    }
+    listen(viewport,'pointerdown',event => {
+      if (!ready || (event.pointerType === 'mouse' && event.button !== 0)) return;
+      viewport.focus({preventScroll:true});pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});
+      viewport.setPointerCapture(event.pointerId);beginGesture();
+    });
+    listen(viewport,'pointermove',event => {
+      if (!pointers.has(event.pointerId) || !gesture) return;
+      pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});
+      if (gesture.kind === 'pinch') {
+        const [a,b] = [...pointers.values()];if (!b) return;
+        const middle = point((a.x+b.x)/2,(a.y+b.y)/2);
+        scale = clamp(gesture.scale * Math.hypot(a.x-b.x,a.y-b.y) / gesture.distance,1,4);
+        const ratio = scale / gesture.scale;
+        x = middle.x - (gesture.middle.x - gesture.x)*ratio;y = middle.y - (gesture.middle.y - gesture.y)*ratio;
+        if (scale <= 1.001) {scale = 1;x = 0;y = 0;}
+        paint();
+      } else {
+        const dx = event.clientX - gesture.start.x, dy = event.clientY - gesture.start.y;
+        if (Math.hypot(dx,dy)>8) gesture.moved = true;
+        if (scale > 1.001) {x = gesture.x + dx;y = gesture.y + dy;paint();}
+      }
+    });
+    function endPointer(event) {
+      if (!pointers.has(event.pointerId)) return;
+      if (event.type !== 'pointerup') lastTap = null;
+      if (event.type === 'pointerup' && event.pointerType === 'touch' && pointers.size === 1 && gesture?.kind === 'pan' && gesture.canTap && !gesture.moved && Date.now()-gesture.at<300) {
+        const now = Date.now();
+        if (lastTap && now-lastTap.time<320 && Math.hypot(event.clientX-lastTap.x,event.clientY-lastTap.y)<24) {
+          toggle(point(event.clientX,event.clientY));touchToggleAt = now;lastTap = null;
+        } else lastTap = {time:now,x:event.clientX,y:event.clientY};
+      }
+      pointers.delete(event.pointerId);
+      if (viewport.hasPointerCapture(event.pointerId)) viewport.releasePointerCapture(event.pointerId);
+      beginGesture();
+    }
+    for (const type of ['pointerup','pointercancel','lostpointercapture']) listen(viewport,type,endPointer);
+    listen(viewport,'dblclick',event => {
+      if (Date.now()-touchToggleAt<500) return;
+      event.preventDefault();toggle(point(event.clientX,event.clientY));
+    });
+    listen(viewport,'wheel',event => {
+      if (!ready) return;
+      event.preventDefault();const units = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? viewport.clientHeight : 1;
+      zoom(scale * Math.exp(-event.deltaY * units * .002),point(event.clientX,event.clientY));
+    },{passive:false});
+    listen(viewport,'keydown',event => {
+      if (scale <= 1.001 || !['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key)) return;
+      event.preventDefault();event.stopPropagation();
+      if (event.key === 'ArrowLeft') x += 40;if (event.key === 'ArrowRight') x -= 40;
+      if (event.key === 'ArrowUp') y += 40;if (event.key === 'ArrowDown') y -= 40;
+      paint();
+    });
+    listen(out,'click',() => zoom(scale/1.25));listen(inside,'click',() => zoom(scale*1.25));listen(resetButton,'click',reset);
+    listen(image,'load',() => {ready = true;viewport.setAttribute('aria-busy','false');paint();});
+    listen(image,'error',() => {ready = false;error.hidden = false;image.hidden = true;viewport.setAttribute('aria-busy','false');paint();});
+    const observer = new ResizeObserver(() => {if (!destroyed) paint();});observer.observe(viewport);
+    image.src = mediaURL(item);if (image.complete && image.naturalWidth) {ready = true;viewport.setAttribute('aria-busy','false');}
+    paint();
+    return {element,focus:() => viewport.focus({preventScroll:true}),zoomIn:() => zoom(scale*1.25),zoomOut:() => zoom(scale/1.25),reset,
+      destroy() {destroyed = true;observer.disconnect();for (const remove of listeners) remove();for (const id of pointers.keys()) {if (viewport.hasPointerCapture(id)) viewport.releasePointerCapture(id);}pointers.clear();}
+    };
+  }
   function renderDetail(item) {
-    const wrap = $('#detail-content'); if (!wrap) return; wrap.replaceChildren();
+    const wrap = $('#detail-content'); if (!wrap) return;
+    activePhotoViewer?.destroy();activePhotoViewer = null;wrap.replaceChildren();
     if (item.type === 'photo') {
-      const image = el('img', 'detail-media'); image.src = mediaURL(item); image.alt = item.title; wrap.append(image);
+      activePhotoViewer = createPhotoViewer(item);wrap.append(activePhotoViewer.element);
     } else if (item.type === 'video') {
       const video = el('video', 'detail-media'); video.src = mediaURL(item); video.controls = true; video.playsInline = true; video.preload = 'metadata'; if (item.poster) video.poster = item.poster;
       video.append(el('p', '', '当前浏览器无法播放这段视频。'));
@@ -415,6 +539,7 @@
   function openDetail(id) {
     const item = allMemories().find(memory => memory.id === id); if (!item) return;
     currentId = id; renderDetail(item); const dialog = $('#detail-dialog'); if (!dialog.open) dialog.showModal();
+    activePhotoViewer?.focus();
   }
   function stepDetail(direction) {
     const list = visibleMemories(); if (list.length < 2) return;
@@ -466,11 +591,17 @@
     if (event.target !== dialog) return; const rect = dialog.getBoundingClientRect();
     if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) dialog.close();
   }));
-  $('#detail-dialog')?.addEventListener('close', () => { $('#detail-content video')?.pause(); });
+  $('#detail-dialog')?.addEventListener('close', () => { $('#detail-content video')?.pause();activePhotoViewer?.destroy();activePhotoViewer = null; });
   $('#detail-prev')?.addEventListener('click', () => stepDetail(-1));
   $('#detail-next')?.addEventListener('click', () => stepDetail(1));
   document.addEventListener('keydown', event => {
-    if (!$('#detail-dialog')?.open || /INPUT|TEXTAREA|SELECT/.test(event.target.tagName)) return;
+    if (!$('#detail-dialog')?.open || event.defaultPrevented || /INPUT|TEXTAREA|SELECT/.test(event.target.tagName) || event.ctrlKey || event.metaKey || event.altKey) return;
+    if (activePhotoViewer && ['+','=','-','0'].includes(event.key)) {
+      event.preventDefault();
+      if (event.key === '+' || event.key === '=') activePhotoViewer.zoomIn();
+      else if (event.key === '-') activePhotoViewer.zoomOut();else activePhotoViewer.reset();
+      return;
+    }
     if (event.key === 'ArrowLeft') { event.preventDefault(); stepDetail(-1); }
     if (event.key === 'ArrowRight') { event.preventDefault(); stepDetail(1); }
   });
