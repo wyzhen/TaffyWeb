@@ -394,9 +394,12 @@
     const level = el('output','photo-zoom-level','100%');level.setAttribute('aria-live','polite');level.setAttribute('aria-label','照片缩放比例');
     const inside = button('in','放大照片','＋');
     const resetButton = button('reset','还原照片至适应窗口','复位');
+    const expandButton = button('expand','铺满窗口查看照片','铺满窗口');
+    expandButton.setAttribute('aria-pressed','false');
     const hint = el('span','photo-zoom-hint','双击 / 滚轮 / 双指缩放 · 放大后拖动');
-    toolbar.append(out,level,inside,resetButton,hint);element.append(viewport,toolbar);
-    let scale = 1, x = 0, y = 0, ready = false, destroyed = false, gesture = null, lastTap = null, touchToggleAt = 0, hadMultiplePointers = false;
+    toolbar.append(out,level,inside,resetButton,expandButton,hint);element.append(viewport,toolbar);
+    const dialog = $('#detail-dialog');
+    let scale = 1, x = 0, y = 0, expanded = false, ready = false, destroyed = false, gesture = null, lastTap = null, touchToggleAt = 0, hadMultiplePointers = false;
     const pointers = new Map(), listeners = [];
     const clamp = (n,min,max) => Math.min(max,Math.max(min,n));
     const point = (clientX,clientY) => {
@@ -412,9 +415,26 @@
       const percent = `${Math.round(scale*100)}%`;if (level.textContent !== percent) level.textContent = percent;
       out.disabled = !ready || scale <= 1.001;inside.disabled = !ready || scale >= 3.999;
       resetButton.disabled = !ready || (scale <= 1.001 && Math.abs(x)<1 && Math.abs(y)<1);
+      expandButton.disabled = !ready;
+    }
+    function setExpanded(value) {
+      if (expanded === value || destroyed) return;
+      expanded = value;dialog.classList.toggle('photo-expanded',expanded);dialog.scrollTop = 0;
+      expandButton.textContent = expanded ? '返回详情' : '铺满窗口';
+      expandButton.setAttribute('aria-label',expanded ? '返回照片详情' : '铺满窗口查看照片');
+      expandButton.setAttribute('aria-pressed',String(expanded));
+      hint.textContent = expanded ? '双击 / 滚轮 / 双指缩放 · 拖动查看 · Esc 返回详情' : '双击 / 滚轮 / 双指缩放 · 放大后拖动';
+      if (!expanded) {scale = 1;x = 0;y = 0;}
+      paint();
     }
     function zoom(next,anchor = {x:0,y:0}) {
       if (!ready || destroyed) return;
+      if (next > 1.001 && !expanded) {
+        // Keep the pointer's screen position when the viewing area expands.
+        const rect = viewport.getBoundingClientRect();
+        const clientX = rect.left + rect.width/2 + anchor.x, clientY = rect.top + rect.height/2 + anchor.y;
+        setExpanded(true);anchor = point(clientX,clientY);
+      }
       const value = clamp(next,1,4), ratio = value / scale;
       x = anchor.x - (anchor.x - x)*ratio;y = anchor.y - (anchor.y - y)*ratio;scale = value;
       if (scale <= 1.001) {scale = 1;x = 0;y = 0;}
@@ -440,7 +460,9 @@
     listen(viewport,'pointerdown',event => {
       if (!ready || (event.pointerType === 'mouse' && event.button !== 0)) return;
       viewport.focus({preventScroll:true});pointers.set(event.pointerId,{x:event.clientX,y:event.clientY});
-      viewport.setPointerCapture(event.pointerId);beginGesture();
+      viewport.setPointerCapture(event.pointerId);
+      if (pointers.size >= 2 && !expanded) setExpanded(true);
+      beginGesture();
     });
     listen(viewport,'pointermove',event => {
       if (!pointers.has(event.pointerId) || !gesture) return;
@@ -490,13 +512,17 @@
       paint();
     });
     listen(out,'click',() => zoom(scale/1.25));listen(inside,'click',() => zoom(scale*1.25));listen(resetButton,'click',reset);
+    listen(expandButton,'click',() => {setExpanded(!expanded);viewport.focus({preventScroll:true});});
+    listen(dialog,'cancel',event => {
+      if (expanded) {event.preventDefault();setExpanded(false);viewport.focus({preventScroll:true});}
+    });
     listen(image,'load',() => {ready = true;viewport.setAttribute('aria-busy','false');paint();});
     listen(image,'error',() => {ready = false;error.hidden = false;image.hidden = true;viewport.setAttribute('aria-busy','false');paint();});
     const observer = new ResizeObserver(() => {if (!destroyed) paint();});observer.observe(viewport);
     image.src = mediaURL(item);if (image.complete && image.naturalWidth) {ready = true;viewport.setAttribute('aria-busy','false');}
     paint();
     return {element,focus:() => viewport.focus({preventScroll:true}),zoomIn:() => zoom(scale*1.25),zoomOut:() => zoom(scale/1.25),reset,
-      destroy() {destroyed = true;observer.disconnect();for (const remove of listeners) remove();for (const id of pointers.keys()) {if (viewport.hasPointerCapture(id)) viewport.releasePointerCapture(id);}pointers.clear();}
+      destroy() {destroyed = true;dialog.classList.remove('photo-expanded');observer.disconnect();for (const remove of listeners) remove();for (const id of pointers.keys()) {if (viewport.hasPointerCapture(id)) viewport.releasePointerCapture(id);}pointers.clear();}
     };
   }
   function renderDetail(item) {
