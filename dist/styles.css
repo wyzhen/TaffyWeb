@@ -30,7 +30,7 @@ img{height:auto}
 .detail-dialog.photo-expanded #detail-content,.detail-dialog.photo-expanded .photo-viewer{height:100%;min-height:0}
 .detail-dialog.photo-expanded .photo-viewport{height:100%;min-height:0;width:100%}
 .detail-dialog.photo-expanded .detail-copy,.detail-dialog.photo-expanded .detail-navigation{display:none}
-.detail-dialog.photo-expanded .photo-toolbar{position:absolute;z-index:2;left:50%;bottom:max(16px,env(safe-area-inset-bottom));transform:translateX(-50%);width:max-content;max-width:calc(100% - 24px);justify-content:center;padding:10px 14px;border:1px solid #efdce3;border-radius:12px;background:#fff8fbe8;box-shadow:0 4px 24px #60485218;backdrop-filter:blur(10px)}
+.detail-dialog.photo-expanded .photo-toolbar{display:none;position:absolute;z-index:2;left:50%;bottom:max(16px,env(safe-area-inset-bottom));transform:translateX(-50%);width:max-content;max-width:calc(100% - 24px);justify-content:center;padding:10px 14px;border:1px solid #efdce3;border-radius:12px;background:#fff8fbe8;box-shadow:0 4px 24px #60485218;backdrop-filter:blur(10px)}
 .detail-dialog.photo-expanded .photo-zoom-hint{flex-basis:100%;text-align:center;margin:0}
 .detail-dialog.photo-expanded .detail-close{top:max(12px,env(safe-area-inset-top));right:max(12px,env(safe-area-inset-right))}
 .photo-zoom-button[data-photo-zoom=expand]{font-size:11px;letter-spacing:.5px;white-space:nowrap}
